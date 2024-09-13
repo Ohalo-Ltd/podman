@@ -17,6 +17,7 @@ import (
 	"github.com/containers/common/pkg/ssh"
 	"github.com/containers/podman/v5/version"
 	"github.com/sirupsen/logrus"
+	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/net/proxy"
 )
 
@@ -79,6 +80,28 @@ func NewConnection(ctx context.Context, uri string) (context.Context, error) {
 	return NewConnectionWithIdentity(ctx, uri, "", false)
 }
 
+// NewConnectionWithSshClient creates a new service connection with an existing SSH client
+// connection
+func NewConnectionWithSSHClient(ctx context.Context, sshClient *gossh.Client, relativePath string) (context.Context, error) {
+	_url, err := url.Parse(relativePath)
+	if err != nil {
+		return nil, fmt.Errorf("value of relativePath is not a valid url: %s: %w", relativePath, err)
+	}
+	_url.Scheme = "ssh"
+	_url.Host = sshClient.RemoteAddr().String()
+	_url.User = url.User(sshClient.User())
+
+	connection := Connection{URI: _url}
+	connection.Client = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return ssh.DialNet(sshClient, "unix", _url)
+			},
+		}}
+
+	return newConnection(ctx, connection)
+}
+
 // NewConnectionWithIdentity takes a URI as a string and returns a context with the
 // Connection embedded as a value.  This context needs to be passed to each
 // endpoint to work correctly.
@@ -86,7 +109,7 @@ func NewConnection(ctx context.Context, uri string) (context.Context, error) {
 // A valid URI connection should be scheme://
 // For example tcp://localhost:<port>
 // or unix:///run/podman/podman.sock
-// or ssh://<user>@<host>[:port]/run/podman/podman.sock
+// or ssh://<user>@<host>[:port]/run/podman/podman.sock?secure=True
 func NewConnectionWithIdentity(ctx context.Context, uri string, identity string, machine bool) (context.Context, error) {
 	var (
 		err error
@@ -108,11 +131,30 @@ func NewConnectionWithIdentity(ctx context.Context, uri string, identity string,
 	var connection Connection
 	switch _url.Scheme {
 	case "ssh":
-		conn, err := sshClient(_url, uri, identity, machine)
-		if err != nil {
-			return nil, err
+		port := 22
+		if _url.Port() != "" {
+			port, err = strconv.Atoi(_url.Port())
+			if err != nil {
+				return nil, err
+			}
 		}
-		connection = conn
+		conn, err := ssh.Dial(&ssh.ConnectionDialOptions{
+			Host:                        uri,
+			Identity:                    identity,
+			User:                        _url.User,
+			Port:                        port,
+			InsecureIsMachineConnection: machine,
+		}, "golang")
+		if err != nil {
+			return nil, newConnectError(err)
+		}
+		connection = Connection{URI: _url}
+		connection.Client = &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return ssh.DialNet(conn, "unix", _url)
+				},
+			}}
 	case "unix":
 		if !strings.HasPrefix(uri, "unix:///") {
 			// autofix unix://path_element vs unix:///path_element
@@ -133,6 +175,10 @@ func NewConnectionWithIdentity(ctx context.Context, uri string, identity string,
 		return nil, fmt.Errorf("unable to create connection. %q is not a supported schema", _url.Scheme)
 	}
 
+	return newConnection(ctx, connection)
+}
+
+func newConnection(ctx context.Context, connection Connection) (context.Context, error) {
 	ctx = context.WithValue(ctx, clientKey, &connection)
 	serviceVersion, err := pingNewConnection(ctx)
 	if err != nil {
@@ -140,40 +186,6 @@ func NewConnectionWithIdentity(ctx context.Context, uri string, identity string,
 	}
 	ctx = context.WithValue(ctx, versionKey, serviceVersion)
 	return ctx, nil
-}
-
-func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connection, error) {
-	var (
-		err error
-	)
-	connection := Connection{
-		URI: _url,
-	}
-	port := 22
-	if _url.Port() != "" {
-		port, err = strconv.Atoi(_url.Port())
-		if err != nil {
-			return connection, err
-		}
-	}
-	conn, err := ssh.Dial(&ssh.ConnectionDialOptions{
-		Host:                        uri,
-		Identity:                    identity,
-		User:                        _url.User,
-		Port:                        port,
-		InsecureIsMachineConnection: machine,
-	}, ssh.GolangMode)
-	if err != nil {
-		return connection, newConnectError(err)
-	}
-	dialContext := func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return ssh.DialNet(conn, "unix", _url)
-	}
-	connection.Client = &http.Client{
-		Transport: &http.Transport{
-			DialContext: dialContext,
-		}}
-	return connection, nil
 }
 
 func tcpClient(_url *url.URL) (Connection, error) {
